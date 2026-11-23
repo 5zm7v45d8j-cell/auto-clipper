@@ -1,0 +1,9 @@
+.env
+.env.*
+credentials/
+*.mp4
+*.json
+clips_out/
+downloads/
+__pycache__/
+.pytest_cache/
