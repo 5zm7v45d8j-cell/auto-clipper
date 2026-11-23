@@ -5,39 +5,60 @@ import math
 import os
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+import urllib.parse
+import urllib.request
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("AutoClipper")
+
+US_STREAMERS = {
+    "IShowSpeed": "https://www.youtube.com/@IShowSpeed",
+    "KaiCenat": "https://www.twitch.tv/kaicenat",
+    "Jynxzi": "https://www.twitch.tv/jynxzi",
+    "xQc": "https://www.twitch.tv/xqc",
+    "TheBurntPeanut": "https://www.twitch.tv/theburntpeanut",
+}
+DE_STREAMERS = {
+    "EliasN97": "https://www.twitch.tv/eliasn97",
+    "Zarbex": "https://www.twitch.tv/zarbex",
+    "Papaplatte": "https://www.twitch.tv/papaplatte",
+    "Trymacs": "https://www.twitch.tv/trymacs",
+    "MontanaBlack": "https://www.twitch.tv/montanablack88",
+}
 
 
 @dataclass
-class ClipConfig:
+class APIConfig:
+    youtube_api_key: Optional[str] = field(default_factory=lambda: os.getenv("YOUTUBE_API_KEY") or None)
+    anthropic_api_key: Optional[str] = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY") or None)
+    anthropic_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"))
+
+
+@dataclass
+class ClipperConfig:
     sample_rate: int = 16000
     frame_step_sec: float = 0.25
     audio_peak_weight: float = 0.45
     audio_rms_weight: float = 0.25
     scene_cut_weight: float = 0.30
-    score_threshold: float = 0.62
-    min_clip_duration: float = 12.0
-    max_clip_duration: float = 60.0
-    pre_roll: float = 3.0
-    post_roll: float = 5.0
-    cooldown_sec: float = 15.0
+    score_threshold: float = 0.60
+    min_clip_duration: float = 30.0
+    max_clip_duration: float = 90.0
+    pre_roll: float = 6.0
+    post_roll: float = 24.0
+    cooldown_sec: float = 25.0
     vertical_9_16: bool = True
     target_width: int = 1080
     target_height: int = 1920
     crf: int = 20
     preset: str = "fast"
+    focus_topics: List[str] = field(default_factory=lambda: ["GTA 6", "viral moment", "crazy reaction", "clutch", "funny"])
 
 
 @dataclass
@@ -47,6 +68,8 @@ class HighlightCandidate:
     audio_peak_norm: float
     audio_rms_norm: float
     scene_cut_norm: float
+    viral_hook: str = ""
+    suggested_title: str = ""
 
 
 @dataclass
@@ -58,334 +81,273 @@ class ClipSpec:
     peak_timestamp: float
     score: float
     output_file: str
+    title: str = ""
+    description: str = ""
+    tags: List[str] = field(default_factory=list)
+
+
+def load_dotenv(env_path: Path = Path(".env")) -> None:
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def check_ffmpeg() -> None:
     try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         raise RuntimeError("FFmpeg wurde nicht gefunden. Bitte installieren und zum PATH hinzufügen.") from exc
 
 
+def search_youtube(api_cfg: APIConfig, query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    if not api_cfg.youtube_api_key:
+        logger.info("YOUTUBE_API_KEY nicht gesetzt – YouTube-Recherche übersprungen.")
+        return []
+    params = urllib.parse.urlencode({"part": "snippet", "q": query, "type": "video", "order": "viewCount", "maxResults": max_results, "key": api_cfg.youtube_api_key})
+    try:
+        with urllib.request.urlopen(f"https://www.googleapis.com/youtube/v3/search?{params}", timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        logger.warning("YouTube-Suche fehlgeschlagen: %s", exc)
+        return []
+    return [{"video_id": item["id"]["videoId"], "url": f"https://www.youtube.com/watch?v={item['id']['videoId']}", "title": item["snippet"].get("title", ""), "channel": item["snippet"].get("channelTitle", "")}
+            for item in payload.get("items", []) if item.get("id", {}).get("videoId")]
+
+
 def extract_pcm_audio(video_path: Path, sample_rate: int) -> np.ndarray:
-    """Extrahiert Mono-PCM-Audio als float32-Array im Bereich [-1.0, 1.0]."""
     logger.info("Extrahiere Audiospur mit %d Hz...", sample_rate)
-    cmd = [
-        "ffmpeg",
-        "-v", "error",
-        "-i", str(video_path),
-        "-ac", "1",
-        "-ar", str(sample_rate),
-        "-f", "s16le",
-        "pipe:1",
-    ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    audio_int16 = np.frombuffer(proc.stdout, dtype=np.int16)
-    if audio_int16.size == 0:
+    proc = subprocess.run(["ffmpeg", "-v", "error", "-i", str(video_path), "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="replace").strip() or "FFmpeg-Audioextraktion fehlgeschlagen")
+    samples = np.frombuffer(proc.stdout, dtype=np.int16)
+    if samples.size == 0:
         raise ValueError("Keine Audiodaten aus dem Video extrahierbar.")
-    return audio_int16.astype(np.float32) / 32768.0
+    return samples.astype(np.float32) / 32768.0
 
 
-def compute_audio_features(
-    samples: np.ndarray, sample_rate: int, step_sec: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Berechnet zeitdiskrete Peak- und RMS-Werte für jedes Zeitfenster."""
-    step_samples = max(1, int(sample_rate * step_sec))
-    win_samples = max(step_samples, int(sample_rate * 1.0))
-    n_steps = max(1, len(samples) // step_samples)
-
-    peaks = np.zeros(n_steps, dtype=np.float32)
-    rms = np.zeros(n_steps, dtype=np.float32)
-
-    for i in range(n_steps):
-        center = i * step_samples
-        start = max(0, center - win_samples // 2)
-        end = min(len(samples), center + win_samples // 2)
-        chunk = samples[start:end]
-        if chunk.size > 0:
-            peaks[i] = float(np.max(np.abs(chunk)))
-            rms[i] = float(np.sqrt(np.mean(chunk ** 2)))
-
+def compute_audio_features(samples: np.ndarray, sample_rate: int, step_sec: float) -> Tuple[np.ndarray, np.ndarray]:
+    step = max(1, int(sample_rate * step_sec))
+    window = max(step, int(sample_rate))
+    count = max(1, len(samples) // step)
+    peaks = np.zeros(count, dtype=np.float32)
+    rms = np.zeros(count, dtype=np.float32)
+    for i in range(count):
+        center = i * step
+        chunk = samples[max(0, center - window // 2):min(len(samples), center + window // 2)]
+        if chunk.size:
+            peaks[i] = np.max(np.abs(chunk))
+            rms[i] = np.sqrt(np.mean(chunk ** 2))
     return peaks, rms
 
 
 def compute_scene_changes(video_path: Path, step_sec: float) -> Tuple[np.ndarray, float]:
-    """Berechnet normalisierte Histogramm-Differenzen zwischen Frames als Szenenwechsel-Signal."""
     logger.info("Analysiere visuelle Szenenwechsel (Intervall: %.2fs)...", step_sec)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Konnte Video nicht öffnen: {video_path}")
-
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = total_frames / fps if total_frames > 0 else 0.0
-
-    frame_stride = max(1, int(round(fps * step_sec)))
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = frames / fps if frames > 0 else 0.0
+    stride = max(1, int(round(fps * step_sec)))
     diffs: List[float] = []
-    prev_hist = None
-    frame_idx = 0
-
+    previous = None
+    frame_index = 0
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        ok, frame = cap.read()
+        if not ok:
             break
-
-        if frame_idx % frame_stride == 0:
+        if frame_index % stride == 0:
             small = cv2.resize(frame, (160, 90))
             hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
             hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
             cv2.normalize(hist, hist)
-
-            if prev_hist is not None:
-                corr = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL))
-                diff = max(0.0, min(1.5, 1.0 - corr))
-                diffs.append(diff)
-            else:
+            if previous is None:
                 diffs.append(0.0)
-
-            prev_hist = hist
-
-        frame_idx += 1
-
+            else:
+                corr = float(cv2.compareHist(previous, hist, cv2.HISTCMP_CORREL))
+                diffs.append(max(0.0, min(1.5, 1.0 - corr)))
+            previous = hist
+        frame_index += 1
     cap.release()
-    arr = np.array(diffs, dtype=np.float32) if diffs else np.zeros(1, dtype=np.float32)
-    if duration <= 0.0:
-        duration = len(arr) * step_sec
-    return arr, duration
+    result = np.array(diffs, dtype=np.float32) if diffs else np.zeros(1, dtype=np.float32)
+    if duration <= 0:
+        duration = len(result) * step_sec
+    return result, duration
 
 
-def normalize_percentile(arr: np.ndarray, p_low: float = 10.0, p_high: float = 97.0) -> np.ndarray:
-    """Robuste Normalisierung auf [0, 1] mittels Perzentilen gegen Ausreißer."""
-    if arr.size == 0:
-        return arr
-    lo = float(np.percentile(arr, p_low))
-    hi = float(np.percentile(arr, p_high))
-    if math.isclose(hi, lo):
-        return np.zeros_like(arr)
-    norm = (arr - lo) / (hi - lo)
-    return np.clip(norm, 0.0, 1.0)
+def normalize_percentile(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return values
+    low = float(np.percentile(values, 10))
+    high = float(np.percentile(values, 97))
+    if math.isclose(low, high):
+        return np.zeros_like(values)
+    return np.clip((values - low) / (high - low), 0.0, 1.0)
 
 
-def detect_candidates(
-    peaks: np.ndarray,
-    rms: np.ndarray,
-    scene_diffs: np.ndarray,
-    step_sec: float,
-    cfg: ClipConfig,
-) -> List[HighlightCandidate]:
-    """Kombiniert Audio- und Visuell-Signale zu gewichteten Highlight-Kandidaten."""
-    n = min(len(peaks), len(rms), len(scene_diffs))
-    if n == 0:
+def detect_candidates(peaks: np.ndarray, rms: np.ndarray, scenes: np.ndarray, step: float, cfg: ClipperConfig) -> List[HighlightCandidate]:
+    count = min(len(peaks), len(rms), len(scenes))
+    if count == 0:
         return []
-
-    p_norm = normalize_percentile(peaks[:n])
-    r_norm = normalize_percentile(rms[:n])
-    s_norm = normalize_percentile(scene_diffs[:n])
-
-    w_sum = cfg.audio_peak_weight + cfg.audio_rms_weight + cfg.scene_cut_weight
-    wp = cfg.audio_peak_weight / w_sum
-    wr = cfg.audio_rms_weight / w_sum
-    ws = cfg.scene_cut_weight / w_sum
-
-    scores = wp * p_norm + wr * r_norm + ws * s_norm
-
-    order = np.argsort(-scores)
-    selected: List[HighlightCandidate] = []
-    accepted_times: List[float] = []
-
-    for idx in order:
-        sc = float(scores[idx])
-        if sc < cfg.score_threshold:
+    peak_norm = normalize_percentile(peaks[:count])
+    rms_norm = normalize_percentile(rms[:count])
+    scene_norm = normalize_percentile(scenes[:count])
+    total = cfg.audio_peak_weight + cfg.audio_rms_weight + cfg.scene_cut_weight
+    scores = (cfg.audio_peak_weight / total) * peak_norm + (cfg.audio_rms_weight / total) * rms_norm + (cfg.scene_cut_weight / total) * scene_norm
+    accepted: List[float] = []
+    result: List[HighlightCandidate] = []
+    for idx in np.argsort(-scores):
+        score = float(scores[idx])
+        if score < cfg.score_threshold:
             break
-        t = idx * step_sec
-        if any(abs(t - prev_t) < cfg.cooldown_sec for prev_t in accepted_times):
+        timestamp = float(idx) * step
+        if any(abs(timestamp - old) < cfg.cooldown_sec for old in accepted):
             continue
-        accepted_times.append(t)
-        selected.append(
-            HighlightCandidate(
-                timestamp=round(t, 2),
-                score=round(sc, 4),
-                audio_peak_norm=round(float(p_norm[idx]), 3),
-                audio_rms_norm=round(float(r_norm[idx]), 3),
-                scene_cut_norm=round(float(s_norm[idx]), 3),
-            )
-        )
-
-    selected.sort(key=lambda c: c.timestamp)
-    return selected
+        accepted.append(timestamp)
+        result.append(HighlightCandidate(round(timestamp, 2), round(score, 4), round(float(peak_norm[idx]), 3), round(float(rms_norm[idx]), 3), round(float(scene_norm[idx]), 3)))
+    return sorted(result, key=lambda candidate: candidate.timestamp)
 
 
-def build_clip_specs(
-    candidates: List[HighlightCandidate],
-    total_duration: float,
-    output_dir: Path,
-    cfg: ClipConfig,
-) -> List[ClipSpec]:
-    """Wandelt Kandidaten in überlappungsfreie Clip-Zeitfenster inkl. Pre-/Post-Roll um."""
-    raw_windows: List[Tuple[float, float, HighlightCandidate]] = []
+def rank_with_claude(candidates: List[HighlightCandidate], streamer: str, cfg: ClipperConfig, api_cfg: APIConfig) -> List[HighlightCandidate]:
+    if not candidates:
+        return candidates
+    if not api_cfg.anthropic_api_key:
+        for i, candidate in enumerate(candidates, 1):
+            candidate.suggested_title = f"{streamer} - Viral Moment #{i} #Shorts"
+            candidate.viral_hook = "Lokaler Audio-/Szenen-Peak"
+        return candidates
+    payload = {"model": api_cfg.anthropic_model, "max_tokens": 1024, "system": "Du kuratierst nur bereits gefundene lokale 30- bis 90-Sekunden-Clip-Kandidaten. Gib ausschließlich ein JSON-Array mit timestamp, viral_hook und suggested_title zurück. Keine erfundenen Zusagen oder Quellen.", "messages": [{"role": "user", "content": json.dumps({"streamer": streamer, "topics": cfg.focus_topics, "candidates": [asdict(c) for c in candidates]}, ensure_ascii=False)}]}
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode(), headers={"x-api-key": api_cfg.anthropic_api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        text = "\n".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`").removeprefix("json").strip()
+        ranked = json.loads(text)
+        by_time = {round(float(item["timestamp"]), 2): item for item in ranked if "timestamp" in item}
+        for candidate in candidates:
+            match = by_time.get(round(candidate.timestamp, 2))
+            if match:
+                candidate.viral_hook = str(match.get("viral_hook", ""))
+                candidate.suggested_title = str(match.get("suggested_title", ""))
+    except Exception as exc:
+        logger.warning("Claude-Bewertung fehlgeschlagen: %s", exc)
+    return candidates
 
-    for cand in candidates:
-        start = max(0.0, cand.timestamp - cfg.pre_roll)
-        end = min(total_duration, cand.timestamp + cfg.post_roll)
-        if end - start < cfg.min_clip_duration:
-            end = min(total_duration, start + cfg.min_clip_duration)
-            start = max(0.0, end - cfg.min_clip_duration)
-        if end - start > cfg.max_clip_duration:
-            end = start + cfg.max_clip_duration
-        if end > start:
-            raw_windows.append((start, end, cand))
 
+def build_clip_specs(candidates: List[HighlightCandidate], duration: float, output_dir: Path, streamer: str, cfg: ClipperConfig) -> List[ClipSpec]:
+    minimum = max(30.0, cfg.min_clip_duration)
+    maximum = min(90.0, max(minimum, cfg.max_clip_duration))
+    windows: List[Tuple[float, float, HighlightCandidate]] = []
+    for candidate in candidates:
+        start = max(0.0, candidate.timestamp - cfg.pre_roll)
+        end = min(duration, candidate.timestamp + cfg.post_roll)
+        if end - start < minimum:
+            end = min(duration, start + minimum)
+            start = max(0.0, end - minimum)
+        if end - start > maximum:
+            end = start + maximum
+        if end - start >= minimum:
+            windows.append((start, end, candidate))
     merged: List[Tuple[float, float, HighlightCandidate]] = []
-    for start, end, cand in raw_windows:
+    for start, end, candidate in windows:
         if not merged:
-            merged.append((start, end, cand))
+            merged.append((start, end, candidate))
             continue
-        prev_start, prev_end, prev_cand = merged[-1]
-        if start <= prev_end + 1.0:
-            new_end = min(total_duration, max(prev_end, end), prev_start + cfg.max_clip_duration)
-            best_cand = cand if cand.score > prev_cand.score else prev_cand
-            merged[-1] = (prev_start, new_end, best_cand)
+        old_start, old_end, old_candidate = merged[-1]
+        if start <= old_end + 1.0:
+            new_end = min(duration, max(old_end, end), old_start + maximum)
+            winner = candidate if candidate.score > old_candidate.score else old_candidate
+            merged[-1] = (old_start, new_end, winner)
         else:
-            merged.append((start, end, cand))
-
+            merged.append((start, end, candidate))
     specs: List[ClipSpec] = []
-    for i, (start, end, cand) in enumerate(merged, start=1):
-        duration = round(end - start, 2)
-        if duration < min(cfg.min_clip_duration, total_duration):
+    for index, (start, end, candidate) in enumerate(merged, 1):
+        clip_duration = round(end - start, 2)
+        if clip_duration < minimum:
             continue
-        filename = f"clip_{i:02d}_{int(start)}s_to_{int(end)}s.mp4"
-        specs.append(
-            ClipSpec(
-                index=i,
-                start=round(start, 2),
-                end=round(end, 2),
-                duration=duration,
-                peak_timestamp=cand.timestamp,
-                score=cand.score,
-                output_file=str(output_dir / filename),
-            )
-        )
-
+        title = candidate.suggested_title or f"{streamer} - Viral Moment #{index} #Shorts"
+        description = f"{candidate.viral_hook or 'Top Moment'} | Streamer: {streamer} | Themen: {', '.join(cfg.focus_topics)} #Shorts #GTA6 #Viral"
+        filename = f"{streamer.lower().replace(' ', '_')}_clip_{index:02d}_{int(start)}s_to_{int(end)}s.mp4"
+        specs.append(ClipSpec(index, round(start, 2), round(end, 2), clip_duration, candidate.timestamp, candidate.score, str(output_dir / filename), title[:100], description, ["Shorts", "GTA6", "Viral", streamer, "Gaming"]))
     return specs
 
 
-def render_clip(input_video: Path, spec: ClipSpec, cfg: ClipConfig) -> None:
-    """Schneidet den Clip per FFmpeg und rendert optional 9:16 mit unscharfem Hintergrund."""
+def render_clip(video: Path, spec: ClipSpec, cfg: ClipperConfig) -> None:
     if cfg.vertical_9_16:
         w, h = cfg.target_width, cfg.target_height
-        vf = (
-            f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
-            f"crop={w}:{h},boxblur=20:5[bg];"
-            f"[0:v]scale={w}:-2:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[vout]"
-        )
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-v", "error",
-            "-ss", f"{spec.start:.3f}",
-            "-to", f"{spec.end:.3f}",
-            "-i", str(input_video),
-            "-filter_complex", vf,
-            "-map", "[vout]",
-            "-map", "0:a?",
-            "-c:v", "libx264",
-            "-preset", cfg.preset,
-            "-crf", str(cfg.crf),
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            spec.output_file,
-        ]
+        vf = f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},boxblur=20:5[bg];[0:v]scale={w}:-2:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[vout]"
+        cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{spec.start:.3f}", "-i", str(video), "-t", f"{spec.duration:.3f}", "-filter_complex", vf, "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", cfg.preset, "-crf", str(cfg.crf), "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", spec.output_file]
     else:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-v", "error",
-            "-ss", f"{spec.start:.3f}",
-            "-to", f"{spec.end:.3f}",
-            "-i", str(input_video),
-            "-c:v", "libx264",
-            "-preset", cfg.preset,
-            "-crf", str(cfg.crf),
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            spec.output_file,
-        ]
-
+        cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{spec.start:.3f}", "-i", str(video), "-t", f"{spec.duration:.3f}", "-c:v", "libx264", "-preset", cfg.preset, "-crf", str(cfg.crf), "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", spec.output_file]
     subprocess.run(cmd, check=True)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Komplexer Multi-Signal Auto-Clipper")
-    parser.add_argument("input_video", type=Path, help="Pfad zum Quellvideo")
-    parser.add_argument("-o", "--output-dir", type=Path, default=Path("clips_out"), help="Zielordner")
-    parser.add_argument("--threshold", type=float, default=0.62, help="Score-Schwelle (0.0 - 1.0)")
-    parser.add_argument("--min-len", type=float, default=12.0, help="Minimale Cliplänge in Sekunden")
-    parser.add_argument("--max-len", type=float, default=60.0, help="Maximale Cliplänge in Sekunden")
-    parser.add_argument("--cooldown", type=float, default=15.0, help="Mindestabstand zwischen Peaks (s)")
-    parser.add_argument("--no-vertical", action="store_true", help="Behält Original-Seitenverhältnis bei")
-    parser.add_argument("--dry-run", action="store_true", help="Nur analysieren und Manifest schreiben")
+    parser = argparse.ArgumentParser(description="US/DE Streamer Multi-Signal Auto-Clipper")
+    parser.add_argument("input_video", nargs="?", type=Path)
+    parser.add_argument("--streamer", default="Streamer")
+    parser.add_argument("-o", "--output-dir", type=Path, default=Path("clips_out"))
+    parser.add_argument("--min-len", type=float, default=30.0)
+    parser.add_argument("--max-len", type=float, default=90.0)
+    parser.add_argument("--threshold", type=float, default=0.60)
+    parser.add_argument("--search-query", default="GTA 6 viral streamer moments")
+    parser.add_argument("--list-streamers", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
+    load_dotenv()
     args = parse_args()
-    check_ffmpeg()
-
+    if args.list_streamers:
+        print("=== US STREAMER ===")
+        for name, url in US_STREAMERS.items(): print(f"- {name}: {url}")
+        print("=== DE STREAMER ===")
+        for name, url in DE_STREAMERS.items(): print(f"- {name}: {url}")
+        return 0
+    if args.input_video is None:
+        logger.error("Keine Eingabedatei angegeben. Nutzung: python auto_clipper.py video.mp4")
+        return 2
+    min_len = max(30.0, args.min_len)
+    max_len = min(90.0, max(min_len, args.max_len))
+    cfg = ClipperConfig(min_clip_duration=min_len, max_clip_duration=max_len, score_threshold=args.threshold)
+    api_cfg = APIConfig()
+    try:
+        check_ffmpeg()
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return 2
     if not args.input_video.exists():
         logger.error("Eingabedatei existiert nicht: %s", args.input_video)
-        sys.exit(1)
-
+        return 2
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    cfg = ClipConfig(
-        score_threshold=args.threshold,
-        min_clip_duration=args.min_len,
-        max_clip_duration=args.max_len,
-        cooldown_sec=args.cooldown,
-        vertical_9_16=not args.no_vertical,
-    )
-
+    youtube_results = search_youtube(api_cfg, args.search_query)
     samples = extract_pcm_audio(args.input_video, cfg.sample_rate)
     peaks, rms = compute_audio_features(samples, cfg.sample_rate, cfg.frame_step_sec)
-    scene_diffs, duration = compute_scene_changes(args.input_video, cfg.frame_step_sec)
-
-    candidates = detect_candidates(peaks, rms, scene_diffs, cfg.frame_step_sec, cfg)
-    logger.info("Gefundene Highlight-Kandidaten: %d", len(candidates))
-
-    specs = build_clip_specs(candidates, duration, args.output_dir, cfg)
-    logger.info("Erzeugte Clip-Spezifikationen: %d", len(specs))
-
-    manifest = {
-        "source_video": str(args.input_video),
-        "duration_sec": round(duration, 2),
-        "config": asdict(cfg),
-        "candidates": [asdict(c) for c in candidates],
-        "clips": [asdict(s) for s in specs],
-    }
+    scenes, duration = compute_scene_changes(args.input_video, cfg.frame_step_sec)
+    candidates = rank_with_claude(detect_candidates(peaks, rms, scenes, cfg.frame_step_sec, cfg), args.streamer, cfg, api_cfg)
+    specs = build_clip_specs(candidates, duration, args.output_dir, args.streamer, cfg)
+    manifest = {"source_video": str(args.input_video), "streamer": args.streamer, "duration_sec": round(duration, 2), "config": asdict(cfg), "youtube_search": youtube_results, "candidates": [asdict(c) for c in candidates], "clips": [asdict(s) for s in specs]}
     manifest_path = args.output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-    logger.info("Manifest gespeichert unter: %s", manifest_path)
-
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Manifest gespeichert: %s (%d Clips)", manifest_path, len(specs))
     if args.dry_run:
-        logger.info("Dry-Run aktiv – es werden keine Videodateien gerendert.")
-        return
-
+        return 0
     for spec in specs:
-        logger.info(
-            "Rendere Clip #%d (%.2fs - %.2fs, Score %.3f)...",
-            spec.index, spec.start, spec.end, spec.score,
-        )
+        logger.info("Rendere Clip #%d: %.2fs-%.2fs", spec.index, spec.start, spec.end)
         render_clip(args.input_video, spec, cfg)
-
-    logger.info("Fertig! Alle Clips liegen in '%s'.", args.output_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
