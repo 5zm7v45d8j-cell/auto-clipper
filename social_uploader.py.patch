@@ -1,0 +1,15 @@
+    def save_queue_merged(path: Path, updates: Dict[str, Dict]) -> None:
+        """Re-read live queue and merge only uploads for currently eligible clips."""
+        live = load_queue(path)
+        by_id = {c.get("clip_id"): c for c in live.get("clips", []) if c.get("clip_id")}
+        for clip_id, update in updates.items():
+            clip = by_id.get(clip_id)
+            if not clip:
+                continue
+            if clip.get("approval_status") != "approved" or clip.get("rights_confirmed") is not True:
+                continue
+            targets = sorted(set(clip.get("uploaded_targets", [])) | set(update.get("uploaded_targets", [])))
+            clip["uploaded_targets"] = targets
+            requested = set(update.get("requested_platforms", []))
+            if requested and requested.issubset(set(targets)):
+                clip["approval_status"] = "uploaded"

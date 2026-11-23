@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Guided, fail-safe daily workflow for auto-clipper.
-
-This wrapper never performs a live upload unless the explicit upload mode
-is selected after human review. It uses only existing local scripts.
-"""
+"""Guided, fail-safe daily workflow for auto-clipper."""
 from __future__ import annotations
 
 import argparse
@@ -13,15 +9,14 @@ from pathlib import Path
 
 
 def run(command: list[str]) -> int:
-    completed = subprocess.run(command, check=False)
-    return completed.returncode
+    return subprocess.run(command, check=False).returncode
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tagesablauf für Auto-Clipper")
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    generate = sub.add_parser("generieren", help="Clips analysieren und wartende Queue erstellen")
+    generate = sub.add_parser("generieren", help="Clips analysieren und Queue erstellen")
     generate.add_argument("input_video", type=Path)
     generate.add_argument("--streamer", default="Streamer")
     generate.add_argument("--topic", default="GTA 6")
@@ -33,10 +28,10 @@ def parse_args() -> argparse.Namespace:
     sub.add_parser("status", help="Warteschlangenstatus anzeigen")
     sub.add_parser("trockenlauf", help="Uploads nur simulieren")
 
-    upload = sub.add_parser("hochladen", help="Nach menschlicher Freigabe hochladen")
+    upload = sub.add_parser("hochladen", help="Nach manueller Freigabe hochladen")
     upload.add_argument("--platforms", nargs="+", choices=["youtube", "tiktok"], default=["youtube", "tiktok"])
     upload.add_argument("--yt-privacy", choices=["private", "unlisted", "public"], default="private")
-
+    upload.add_argument("--yes", action="store_true", help="Zusätzliche Terminal-Bestätigung überspringen")
     return parser.parse_args()
 
 
@@ -47,12 +42,10 @@ def main() -> int:
         if not args.input_video.is_file():
             print(f"Eingabedatei fehlt: {args.input_video}", file=sys.stderr)
             return 2
-        command = [
-            sys.executable, "auto_clipper.py", str(args.input_video),
-            "--streamer", args.streamer, "--topic", args.topic,
-            "--queue-file", str(args.queue),
-            "--min-len", str(args.min_len), "--max-len", str(args.max_len),
-        ]
+        command = [sys.executable, "auto_clipper.py", str(args.input_video),
+                   "--streamer", args.streamer, "--topic", args.topic,
+                   "--queue-file", str(args.queue), "--min-len", str(args.min_len),
+                   "--max-len", str(args.max_len)]
         return run(command)
 
     if args.mode == "pruefen":
@@ -65,12 +58,13 @@ def main() -> int:
         return run([sys.executable, "social_uploader.py"])
 
     if args.mode == "hochladen":
-        command = [
-            sys.executable, "social_uploader.py", "--upload",
-            "--platforms", *args.platforms,
-            "--yt-privacy", args.yt_privacy,
-        ]
-        print("ECHTER UPLOAD wird gestartet. Nur approved+rights_confirmed=true Clips werden verarbeitet.")
+        if not args.yes:
+            answer = input("Wirklich einen Live-Upload starten? [ja/nein]: ").strip().lower()
+            if answer not in {"ja", "j", "yes", "y"}:
+                print("Upload abgebrochen.")
+                return 0
+        command = [sys.executable, "social_uploader.py", "--upload",
+                   "--platforms", *args.platforms, "--yt-privacy", args.yt_privacy]
         return run(command)
 
     return 2
