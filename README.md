@@ -1,68 +1,42 @@
 # auto-clipper
 
-Automatische Recherche und Erstellung kurzer Clips aus **rechtlich freigegebenen** YouTube-Videos und Livestream-Aufzeichnungen.
+Automatische lokale Clip-Erstellung für Videos, die du rechtlich bearbeiten darfst. Ermittelt Audio-/Szenen-Peaks, transkribiert optional mit faster-whisper, lässt Claude Transkript-Kontext bewerten und kann aktuelle Themen mit Gemini plus Google Search Grounding recherchieren.
 
-## Sicherheit
+## Rechtliche Nutzung und Uploads
 
-- `channels.txt` enthält nur explizit freigegebene Kanäle im Format:
-
-  ```text
-  https://www.youtube.com/@IShowSpeed|approved=true
-  ```
-
-- Ohne `approved=true` wird ein Kanal nicht verarbeitet.
-- Ohne ausdrückliche Erlaubnis dürfen fremde Videos nicht heruntergeladen oder veröffentlicht werden.
-- YouTube-Uploads sind standardmäßig `private`.
-- API-Schlüssel und OAuth-Dateien dürfen niemals ins Repository committed werden.
+Verarbeite und veröffentliche ausschließlich Videos, für die du Rechte oder eine ausdrückliche Erlaubnis hast. Die Streamer-Liste ist lediglich eine Referenz, keine Nutzungserlaubnis. Das Skript lädt keine fremden Streams/Videos herunter und veröffentlicht nichts automatisch. Der separate YouTube-Uploader bleibt ein expliziter manueller Schritt und verwendet standardmäßig `private`.
 
 ## Voraussetzungen
 
-- Python 3.10 oder neuer
-- FFmpeg im `PATH`
-- Optional: Anthropic API-Key
-- Optional: YouTube Data API-Key
-- Für YouTube-Uploads: Google-OAuth-Client-ID und OAuth-Client-Geheimnis
-
-## Installation
+- Python 3.10+
+- FFmpeg im PATH
+- Optional: `GEMINI_API_KEY` für aktuelle Recherche und Quellenmetadaten
+- Optional: `ANTHROPIC_API_KEY` für Titel/Hook-Bewertung aus Transkript-Kontext
+- Optional: `YOUTUBE_API_KEY` für YouTube-Suchmetadaten (kein Upload-Zugang)
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Beispiel für `.env`:
+Trage Schlüssel lokal in `.env` ein. `.env` und OAuth-Credentials sind ignoriert und gehören nicht ins Git-Repository.
 
-```text
-ANTHROPIC_API_KEY=...
-YOUTUBE_API_KEY=...
-YOUTUBE_OAUTH_CLIENT_JSON=credentials/google-oauth.json
-YOUTUBE_UPLOAD_PRIVACY=private
-```
-
-## Nutzung
-
-Multi-Signal-Analyse eines lokalen Videos:
+## Start
 
 ```bash
-python auto_clipper.py eingabe.mp4 --dry-run
-python auto_clipper.py eingabe.mp4 -o clips_out
+python auto_clipper.py --list-streamers
+python auto_clipper.py video.mp4 --streamer "IShowSpeed" --topic "GTA 6" --dry-run
+python auto_clipper.py video.mp4 --streamer "IShowSpeed" --topic "GTA 6" -o clips_out
 ```
 
-Freigegebene YouTube-Kanäle recherchieren und verarbeiten:
+`--dry-run` erstellt ein JSON-Manifest mit Transkript, gefundenen Kandidaten, Recherche-Zusammenfassung und Gemini-Quellen-URLs; es rendert keine Clips. Verwende `--no-transcript` oder `--no-research`, um diese optionalen Schritte abzuschalten. Whisper kann beim ersten Start sein Modell herunterladen.
+
+Clips werden auf 30–90 Sekunden begrenzt. Kurzvideos unter der gewählten Mindestlänge ergeben keine Clips. Gemini-Recherche und YouTube-Metadatensuche sind getrennte Dienste; Google Search Grounding benötigt `GEMINI_API_KEY`, YouTube-Suche `YOUTUBE_API_KEY`.
+
+## YouTube Upload
+
+Für Uploads brauchst du OAuth-Zugang und die YouTube Data API. Ein API-Key allein reicht nicht. Upload weiterhin manuell und zunächst privat:
 
 ```bash
-python clip_pipeline.py --once --dry-run
-python clip_pipeline.py --once --clips 6 --min-score 0.62
+python upload_youtube.py clip.mp4 --title "Titel" --description "Beschreibung"
 ```
-
-YouTube-Clip privat hochladen:
-
-```bash
-python upload_youtube.py clip.mp4 --title "Clip-Titel" --description "Beschreibung"
-```
-
-Weitere Parameter werden durch `python clip_pipeline.py --help` angezeigt.
-
-## Geplante Länge
-
-Standardmäßig werden Clips zwischen 30 und 90 Sekunden erstellt. Die Pipeline passt bestehende Mindest-/Maximalwerte entsprechend an.
