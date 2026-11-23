@@ -1,4 +1,6 @@
-# Lokale Freigaben für die Verarbeitung
-# Format: YOUTUBE_KANAL_URL|approved=true
-# Nur Zeilen mit approved=true werden verarbeitet.
-
+# Rechte müssen für jede Quelle ausdrücklich vorliegen.
+# YouTube-Quellen für clip_pipeline.py: URL|approved=true|rights_confirmed=true
+# Twitch-Quellen für twitch_live.py: twitch|login|rights_confirmed=true
+# Beispiele unten sind auskommentiert und werden nicht verarbeitet.
+# https://www.youtube.com/@your-authorized-channel|approved=true|rights_confirmed=true
+# twitch|your_authorized_channel|rights_confirmed=true
