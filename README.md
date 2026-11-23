@@ -7,6 +7,7 @@ Automatischer Clip-Bot für US-Streamer: lädt YouTube-Videos beziehungsweise Li
 - Python 3.10 oder neuer
 - `ffmpeg` im `PATH`
 - Gemini API-Key
+- OpenCV
 
 ## Installation
 
@@ -23,6 +24,13 @@ Alle konfigurierten Kanäle aus `channels.txt` einmal verarbeiten:
 python clip_maker.py --once
 ```
 
+Ein einzelnes lokales Video mit dem Multi-Signal-Clipper analysieren:
+
+```bash
+python auto_clipper.py eingabe.mp4 --dry-run
+python auto_clipper.py eingabe.mp4 -o clips_out
+```
+
 Ein einzelnes YouTube-Video mit dem Gaming-Split-Layout verarbeiten:
 
 ```bash
@@ -36,4 +44,5 @@ python clip_maker.py --watch 30
 python clip_maker.py --once --clips 6 --min-score 8
 python clip_maker.py --once --no-subs --no-norm
 python clip_maker.py --once --cookies-from-browser chrome
+python auto_clipper.py eingabe.mp4 --no-vertical --max-len 45
 ```
